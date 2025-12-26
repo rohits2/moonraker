@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
+from uuid import uuid4
 from ..common import JobEvent, RequestType
 
 # Annotation imports
@@ -136,6 +137,10 @@ class JobQueue:
                         raise self.server.error(
                             "Queue State Changed during Transition Gcode")
                 self._set_queue_state("starting")
+                # Notify history component of the job_id before starting print
+                self.server.send_event(
+                    "job_queue:job_starting", job.job_id, job.user
+                )
                 await kapis.start_print(
                     filename, wait_klippy_started=True, user=job.user
                 )
@@ -334,7 +339,7 @@ class JobQueue:
 class QueuedJob:
     def __init__(self, filename: str, user: Optional[UserInfo] = None) -> None:
         self.filename = filename
-        self.job_id = f"{id(self):016X}"
+        self.job_id = str(uuid4())
         self.time_added = time.time()
         self._user = user
 

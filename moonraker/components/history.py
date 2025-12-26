@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 import logging
 from asyncio import Lock
+from uuid import uuid4
 from ..common import (
     JobEvent,
     RequestType,
@@ -122,10 +123,12 @@ class HistorySqlDefinition(SqlTableDefinition):
     prototype = (
         f"""
         {HIST_TABLE} (
-            job_id INTEGER PRIMARY KEY ASC,
+            job_id TEXT(36) PRIMARY KEY,
+            job_number INTEGER UNIQUE,
             user TEXT NOT NULL,
             filename TEXT,
             status TEXT NOT NULL,
+            create_time REAL NOT NULL,
             start_time REAL NOT NULL,
             end_time REAL,
             print_duration REAL NOT NULL,
@@ -137,7 +140,7 @@ class HistorySqlDefinition(SqlTableDefinition):
         )
         """
     )
-    version = 1
+    version = 2
 
     def _get_entry_item(
         self, entry: Dict[str, Any], name: str, default: Any = 0.
@@ -148,8 +151,11 @@ class HistorySqlDefinition(SqlTableDefinition):
         return val
 
     def migrate(self, last_version: int, db_provider: DBProviderWrapper) -> None:
+        conn = db_provider.connection
         if last_version == 0:
-            conn = db_provider.connection
+            # Migrate from "history" namespace to new schema (v2)
+            logging.info("Migrating history from namespace to v2 schema...")
+            job_number = 0
             for batch in db_provider.iter_namespace("history", 1000):
                 conv_vals: List[Tuple[Any, ...]] = []
                 entry: Dict[str, Any]
@@ -160,13 +166,17 @@ class HistorySqlDefinition(SqlTableDefinition):
                         )
                         continue
                     try:
+                        job_number += 1
+                        start_time = self._get_entry_item(entry, "start_time")
                         conv_vals.append(
                             (
-                                None,
+                                str(uuid4()),  # job_id (UUID)
+                                job_number,    # job_number (sequential)
                                 self._get_entry_item(entry, "user", "No User"),
                                 self._get_entry_item(entry, "filename", "unknown"),
                                 self._get_entry_item(entry, "status", "error"),
-                                self._get_entry_item(entry, "start_time"),
+                                start_time,    # create_time (use start_time)
+                                start_time,    # start_time
                                 self._get_entry_item(entry, "end_time"),
                                 self._get_entry_item(entry, "print_duration"),
                                 self._get_entry_item(entry, "total_duration"),
@@ -187,6 +197,53 @@ class HistorySqlDefinition(SqlTableDefinition):
                         conv_vals
                     )
             db_provider.wipe_local_namespace("history")
+        elif last_version == 1:
+            # Migrate from v1 schema (INTEGER job_id) to v2 (UUID + job_number)
+            logging.info("Migrating history from v1 to v2 schema...")
+            # Read all existing records
+            cursor = conn.execute(
+                f"SELECT job_id, user, filename, status, start_time, end_time, "
+                f"print_duration, total_duration, filament_used, metadata, "
+                f"auxiliary_data, instance_id FROM {HIST_TABLE} ORDER BY job_id ASC"
+            )
+            old_records = cursor.fetchall()
+            
+            # Drop and recreate table with new schema
+            with conn:
+                conn.execute(f"DROP TABLE {HIST_TABLE}")
+                conn.execute(f"CREATE TABLE {self.prototype}")
+            
+            # Re-insert records with UUID and job_number
+            if old_records:
+                conv_vals = []
+                for row in old_records:
+                    old_job_id = row[0]  # This becomes job_number
+                    start_time = row[4]
+                    conv_vals.append(
+                        (
+                            str(uuid4()),   # job_id (new UUID)
+                            old_job_id,     # job_number (old integer id)
+                            row[1],         # user
+                            row[2],         # filename
+                            row[3],         # status
+                            start_time,     # create_time (use start_time)
+                            start_time,     # start_time
+                            row[5],         # end_time
+                            row[6],         # print_duration
+                            row[7],         # total_duration
+                            row[8],         # filament_used
+                            row[9],         # metadata
+                            row[10],        # auxiliary_data
+                            row[11]         # instance_id
+                        )
+                    )
+                placeholders = ",".join("?" * len(conv_vals[0]))
+                with conn:
+                    conn.executemany(
+                        f"INSERT INTO {HIST_TABLE} VALUES({placeholders})",
+                        conv_vals
+                    )
+            logging.info(f"Migrated {len(old_records)} history records to v2 schema")
 
 class History:
     def __init__(self, config: ConfigHelper) -> None:
@@ -209,6 +266,8 @@ class History:
             "job_state:state_changed", self._on_job_state_changed)
         self.server.register_event_handler(
             "klippy_apis:job_start_complete", self._on_job_requested)
+        self.server.register_event_handler(
+            "job_queue:job_starting", self._on_queue_job_starting)
         self.server.register_notification("history:history_changed")
 
         self.server.register_endpoint(
@@ -227,7 +286,9 @@ class History:
         )
 
         self.current_job: Optional[PrinterJob] = None
-        self.current_job_id: Optional[int] = None
+        self.current_job_id: Optional[str] = None
+        self.current_job_number: Optional[int] = None
+        self.pending_job_id: Optional[str] = None
         self.job_user: str = "No User"
         self.job_paused: bool = False
 
@@ -272,13 +333,13 @@ class History:
             if req_type == RequestType.GET:
                 job_id = web_request.get_str("uid")
                 cursor = await self.history_table.execute(
-                    f"SELECT * FROM {HIST_TABLE} WHERE job_id = ?", (int(job_id, 16),)
+                    f"SELECT * FROM {HIST_TABLE} WHERE job_id = ?", (job_id,)
                 )
                 result = await cursor.fetchone()
                 if result is None:
                     raise self.server.error(f"Invalid job uid: {job_id}", 404)
                 job = dict(result)
-                return {"job": self._prep_requested_job(job, job_id)}
+                return {"job": self._prep_requested_job(job)}
             if req_type == RequestType.DELETE:
                 all = web_request.get_boolean("all", False)
                 if all:
@@ -287,7 +348,7 @@ class History:
                         ("default",)
                     )
                     await cursor.set_arraysize(1000)
-                    deljobs = [f"{row[0]:06X}" for row in await cursor.fetchall()]
+                    deljobs = [row[0] for row in await cursor.fetchall()]
                     async with self.history_table as tx:
                         await tx.execute(
                             f"DELETE FROM {HIST_TABLE} WHERE instance_id = ?",
@@ -298,7 +359,7 @@ class History:
                 job_id = web_request.get_str("uid")
                 async with self.history_table as tx:
                     cursor = await tx.execute(
-                        f"DELETE FROM {HIST_TABLE} WHERE job_id = ?", (int(job_id, 16),)
+                        f"DELETE FROM {HIST_TABLE} WHERE job_id = ?", (job_id,)
                     )
                 if cursor.rowcount < 1:
                     raise self.server.error(f"Invalid job uid: {job_id}", 404)
@@ -326,7 +387,7 @@ class History:
             if since != -1:
                 sql_statement += " and start_time > ?"
                 values.append(since)
-            sql_statement += f" ORDER BY job_id {order}"
+            sql_statement += f" ORDER BY job_number {order}"
             if limit > 0:
                 sql_statement += " LIMIT ? OFFSET ?"
                 values.append(limit)
@@ -336,8 +397,7 @@ class History:
             jobs: List[Dict[str, Any]] = []
             for row in await cursor.fetchall():
                 job = dict(row)
-                job_id = f"{row['job_id']:06X}"
-                jobs.append(self._prep_requested_job(job, job_id))
+                jobs.append(self._prep_requested_job(job))
             return {"count": len(jobs), "jobs": jobs}
 
     async def _handle_job_totals(
@@ -397,6 +457,12 @@ class History:
         if self.current_job is not None:
             self.current_job.user = username
 
+    def _on_queue_job_starting(self, job_id: str, user: Optional[UserInfo]) -> None:
+        """Called when job queue starts a print, providing the queue's job_id."""
+        self.pending_job_id = job_id
+        if user is not None:
+            self.job_user = user.username
+
     async def _handle_shutdown(self) -> None:
         jstate: JobState = self.server.lookup_component("job_state")
         last_ps = jstate.get_last_stats()
@@ -411,29 +477,48 @@ class History:
         async with self.request_lock:
             self.current_job = job
             self.current_job_id = None
+            self.current_job_number = None
             self.current_job.user = self.job_user
             self.grab_job_metadata()
             for field in self.auxiliary_fields:
                 field.tracker.reset()
             self.current_job.set_aux_data(self.auxiliary_fields)
-            new_id = await self.save_job(job, None)
-            if new_id is None:
+            # Use pending job_id from queue, or generate new UUID
+            job_id = self.pending_job_id or str(uuid4())
+            self.pending_job_id = None
+            # Get next sequential job number
+            job_number = await self._get_next_job_number()
+            result = await self.save_job(job, job_id, job_number)
+            if result is None:
                 logging.info(f"Error saving job, filename '{job.filename}'")
                 return
-            self.current_job_id = new_id
-            job_id = f"{new_id:06X}"
+            self.current_job_id = job_id
+            self.current_job_number = job_number
             self.update_metadata(job_id)
             logging.debug(
-                f"History Job Added - Id: {job_id}, File: {job.filename}"
+                f"History Job Added - Id: {job_id}, Number: {job_number}, "
+                f"File: {job.filename}"
             )
             self.send_history_event("added")
 
-    async def save_job(self, job: PrinterJob, job_id: Optional[int]) -> Optional[int]:
+    async def _get_next_job_number(self) -> int:
+        """Get the next sequential job number."""
+        cursor = await self.history_table.execute(
+            f"SELECT COALESCE(MAX(job_number), 0) + 1 FROM {HIST_TABLE}"
+        )
+        row = await cursor.fetchone()
+        return row[0]
+
+    async def save_job(
+        self, job: PrinterJob, job_id: str, job_number: int
+    ) -> Optional[str]:
         values: List[Any] = [
             job_id,
+            job_number,
             job.user,
             job.filename,
             job.status,
+            job.create_time,
             job.start_time,
             job.end_time,
             job.print_duration,
@@ -445,22 +530,24 @@ class History:
         ]
         placeholders = ",".join("?" * len(values))
         async with self.history_table as tx:
-            cursor = await tx.execute(
+            await tx.execute(
                 f"REPLACE INTO {HIST_TABLE} VALUES({placeholders})", values
             )
-        return cursor.lastrowid
+        return job_id
 
-    async def delete_job(self, job_id: Union[int, str]) -> None:
-        if isinstance(job_id, str):
-            job_id = int(job_id, 16)
+    async def delete_job(self, job_id: str) -> None:
         async with self.history_table as tx:
-            tx.execute(
+            await tx.execute(
                 f"DELETE FROM {HIST_TABLE} WHERE job_id = ?", (job_id,)
             )
 
     async def finish_job(self, status: str, pstats: Dict[str, Any]) -> None:
         async with self.request_lock:
-            if self.current_job is None or self.current_job_id is None:
+            if (
+                self.current_job is None or
+                self.current_job_id is None or
+                self.current_job_number is None
+            ):
                 self._reset_current_job()
                 return
             if (
@@ -474,12 +561,14 @@ class History:
             # Regrab metadata incase metadata wasn't parsed yet due to file upload
             self.grab_job_metadata()
             self.current_job.set_aux_data(self.auxiliary_fields)
-            job_id = f"{self.current_job_id:06X}"
-            await self.save_job(self.current_job, self.current_job_id)
-            self.update_metadata(job_id)
+            await self.save_job(
+                self.current_job, self.current_job_id, self.current_job_number
+            )
+            self.update_metadata(self.current_job_id)
             await self._update_job_totals()
             logging.debug(
-                f"History Job Finished - Id: {job_id}, "
+                f"History Job Finished - Id: {self.current_job_id}, "
+                f"Number: {self.current_job_number}, "
                 f"File: {self.current_job.filename}, "
                 f"Status: {status}"
             )
@@ -489,13 +578,11 @@ class History:
     def _reset_current_job(self) -> None:
         self.current_job = None
         self.current_job_id = None
+        self.current_job_number = None
+        self.pending_job_id = None
         self.job_user = "No User"
 
-    async def get_job(
-        self, job_id: Union[int, str]
-    ) -> Optional[Dict[str, Any]]:
-        if isinstance(job_id, str):
-            job_id = int(job_id, 16)
+    async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         cursor = await self.history_table.execute(
             f"SELECT * FROM {HIST_TABLE} WHERE job_id = ?", (job_id,)
         )
@@ -567,19 +654,18 @@ class History:
     def send_history_event(self, evt_action: str) -> None:
         if self.current_job is None or self.current_job_id is None:
             return
-        job_id = f"{self.current_job_id:06X}"
-        job = self._prep_requested_job(self.current_job.get_stats(), job_id)
+        job_data = self.current_job.get_stats()
+        job_data["job_id"] = self.current_job_id
+        job_data["job_number"] = self.current_job_number
+        job = self._prep_requested_job(job_data)
         self.server.send_event(
             "history:history_changed", {'action': evt_action, 'job': job}
         )
 
-    def _prep_requested_job(
-        self, job: Dict[str, Any], job_id: str
-    ) -> Dict[str, Any]:
+    def _prep_requested_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
         fm = self.file_manager
         mtime = job.get("metadata", {}).get("modified", None)
         job["exists"] = fm.check_file_exists("gcodes", job['filename'], mtime)
-        job["job_id"] = job_id
         job.pop("instance_id", None)
         return job
 
@@ -614,6 +700,7 @@ class PrinterJob:
         self.metadata: Dict[str, Any] = {}
         self.print_duration: float = 0.
         self.status: str = "in_progress"
+        self.create_time = time.time()
         self.start_time = time.time()
         self.total_duration: float = 0.
         self.auxiliary_data: List[Dict[str, Any]] = []
